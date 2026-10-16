@@ -89,7 +89,12 @@ func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID 
 			mergeHeadersIntoFingerprint(cached, headers)
 			needWrite = true
 			logger.LegacyPrintf("service.identity", "Updated fingerprint for account %d: %s (merge update)", accountID, clientUA)
-		} else if time.Since(time.Unix(cached.UpdatedAt, 0)) > 24*time.Hour {
+		}
+		if floorFingerprintVersion(cached) {
+			// 缓存中的 CLI 版本低于当前伪装版本：上游会以"客户端版本过旧"拒绝新模型，强制抬升
+			needWrite = true
+			logger.LegacyPrintf("service.identity", "Raised fingerprint for account %d to %s (version floor)", accountID, cached.UserAgent)
+		} else if !needWrite && time.Since(time.Unix(cached.UpdatedAt, 0)) > 24*time.Hour {
 			// 距上次写入超过24小时，续期TTL
 			needWrite = true
 		}
@@ -105,6 +110,7 @@ func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID 
 
 	// 缓存不存在或解析失败，创建新指纹
 	fp := s.createFingerprintFromHeaders(headers)
+	floorFingerprintVersion(fp)
 
 	// 生成随机ClientID
 	fp.ClientID = generateClientID()
@@ -164,6 +170,22 @@ func mergeHeader(headers http.Header, key string, target *string) {
 	if v := headers.Get(key); v != "" {
 		*target = v
 	}
+}
+
+// floorFingerprintVersion 保证指纹的 claude-cli 版本不低于 claude.CLICurrentVersion。
+// 指纹来自首个请求的客户端 UA 并长期缓存，旧客户端（如 2.1.92）留下的指纹会让上游
+// 以"客户端版本过旧"拒绝新模型。低于下限时把 UA 及与 CLI 版本绑定的 SDK/运行时版本
+// 切换为默认值；OS/Arch 属于机器特征，保留原值。非 claude-cli UA 不处理。
+// 返回是否发生了修改。
+func floorFingerprintVersion(fp *Fingerprint) bool {
+	if fp == nil || !isNewerVersion(defaultFingerprint.UserAgent, fp.UserAgent) {
+		return false
+	}
+	fp.UserAgent = defaultFingerprint.UserAgent
+	fp.StainlessPackageVersion = defaultFingerprint.StainlessPackageVersion
+	fp.StainlessRuntime = defaultFingerprint.StainlessRuntime
+	fp.StainlessRuntimeVersion = defaultFingerprint.StainlessRuntimeVersion
+	return true
 }
 
 // getHeaderOrDefault 获取header值，如果不存在则返回默认值
